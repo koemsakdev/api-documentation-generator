@@ -3,21 +3,17 @@ import {
   DocumentationProject,
   DocumentationSection,
   DocumentationTheme,
-  DocumentationMetadata,
   Endpoint,
-  QualityReport,
-} from '../types/documentation';
+  ProjectMetadata,
+} from '@/lib/types/documentation';
 import { samplePostmanCollection } from '../sample/sample-collection';
 import { normalizePostmanCollection } from '../postman/normalizer';
 import { calculateQualityReport } from '../postman/quality';
 
-export type AppView = 'landing' | 'overview' | 'workspace';
-export type WorkspaceViewMode = 'split' | 'editor' | 'preview';
-
 interface DocumentationStore {
   project: DocumentationProject | null;
-  activeView: AppView;
-  workspaceViewMode: WorkspaceViewMode;
+  activeView: 'landing' | 'overview' | 'workspace' | 'preview';
+  workspaceViewMode: 'split' | 'editor-only' | 'doc-only';
   selectedSectionId: string | null;
   isThemeDrawerOpen: boolean;
   isExportDialogOpen: boolean;
@@ -27,16 +23,15 @@ interface DocumentationStore {
   // Actions
   setProject: (project: DocumentationProject) => void;
   loadSampleProject: () => void;
-  setActiveView: (view: AppView) => void;
-  setWorkspaceViewMode: (mode: WorkspaceViewMode) => void;
+  setActiveView: (view: 'landing' | 'overview' | 'workspace' | 'preview') => void;
+  setWorkspaceViewMode: (mode: 'split' | 'editor-only' | 'doc-only') => void;
   setSelectedSectionId: (id: string | null) => void;
   setThemeDrawerOpen: (open: boolean) => void;
   setExportDialogOpen: (open: boolean) => void;
   setSecretsModalOpen: (open: boolean) => void;
   setSearchQuery: (query: string) => void;
 
-  // Document Editing Actions
-  updateMetadata: (metadata: Partial<DocumentationMetadata>) => void;
+  updateMetadata: (meta: Partial<ProjectMetadata>) => void;
   updateTheme: (theme: Partial<DocumentationTheme>) => void;
   updateSection: (sectionId: string, updates: Partial<DocumentationSection>) => void;
   updateEndpoint: (sectionId: string, endpointUpdates: Partial<Endpoint>) => void;
@@ -46,20 +41,41 @@ interface DocumentationStore {
   resetProject: () => void;
 }
 
-const STORAGE_KEY = 'api_doc_project_state_v1';
+const STORAGE_KEY = 'api_doc_project_state_v4';
+
+// Initialize default sample project with authentic Postman theme & Google Sans
+const defaultSampleProject = normalizePostmanCollection(samplePostmanCollection, { maskSecrets: true });
+
+// Find the first endpoint (e.g. User Login / Refresh Token)
+let initialEndpointId: string | null = null;
+for (const sec of defaultSampleProject.sections) {
+  if (sec.type === 'endpoint') {
+    initialEndpointId = sec.id;
+    break;
+  }
+  if (sec.children && sec.children.length > 0) {
+    const childEp = sec.children.find((c) => c.type === 'endpoint');
+    if (childEp) {
+      initialEndpointId = childEp.id;
+      break;
+    }
+  }
+}
+if (!initialEndpointId) {
+  initialEndpointId = defaultSampleProject.sections[2]?.id || defaultSampleProject.sections[0]?.id;
+}
 
 export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
-  project: null,
-  activeView: 'landing',
+  project: defaultSampleProject,
+  activeView: 'workspace', // Immediately show workspace so user sees results instantly
   workspaceViewMode: 'split',
-  selectedSectionId: null,
+  selectedSectionId: initialEndpointId,
   isThemeDrawerOpen: false,
   isExportDialogOpen: false,
   isSecretsModalOpen: false,
   searchQuery: '',
 
   setProject: (project: DocumentationProject) => {
-    // Recalculate health
     project.qualityReport = calculateQualityReport(project);
     try {
       if (typeof window !== 'undefined') {
@@ -70,8 +86,8 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
     }
     set({
       project,
-      activeView: 'overview',
-      selectedSectionId: project.sections[0]?.id || null,
+      activeView: 'workspace',
+      selectedSectionId: project.sections[2]?.id || project.sections[0]?.id || null,
     });
   },
 
@@ -79,8 +95,8 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
     const project = normalizePostmanCollection(samplePostmanCollection, { maskSecrets: true });
     set({
       project,
-      activeView: 'overview',
-      selectedSectionId: project.sections[2]?.id || project.sections[0]?.id,
+      activeView: 'workspace',
+      selectedSectionId: initialEndpointId,
     });
   },
 
@@ -136,7 +152,6 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
       sections: updatedSections,
       updatedAt: new Date().toISOString(),
     };
-    updatedProject.qualityReport = calculateQualityReport(updatedProject);
     set({ project: updatedProject });
   },
 
@@ -147,9 +162,11 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
     function updateEpRecursive(secs: DocumentationSection[]): DocumentationSection[] {
       return secs.map((sec) => {
         if (sec.id === sectionId && sec.endpoint) {
+          const updatedEndpoint = { ...sec.endpoint, ...endpointUpdates };
           return {
             ...sec,
-            endpoint: { ...sec.endpoint, ...endpointUpdates },
+            title: updatedEndpoint.name || sec.title,
+            endpoint: updatedEndpoint,
           };
         }
         if (sec.children) {
@@ -160,26 +177,27 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
     }
 
     const updatedSections = updateEpRecursive(p.sections);
-    const updatedProject = {
-      ...p,
-      sections: updatedSections,
-      updatedAt: new Date().toISOString(),
-    };
-    updatedProject.qualityReport = calculateQualityReport(updatedProject);
-    set({ project: updatedProject });
+    set({
+      project: {
+        ...p,
+        sections: updatedSections,
+        updatedAt: new Date().toISOString(),
+      },
+    });
   },
 
   toggleMaskSecrets: () => {
     const p = get().project;
     if (!p) return;
-    const currentlyMasked = p.secrets.every((s) => s.isMasked);
-    const newMaskState = !currentlyMasked;
+    const anyMasked = p.secrets.some((s) => s.isMasked);
+    const newMaskState = !anyMasked;
 
     const updatedSecrets = p.secrets.map((s) => ({ ...s, isMasked: newMaskState }));
     set({
       project: {
         ...p,
         secrets: updatedSecrets,
+        updatedAt: new Date().toISOString(),
       },
     });
   },
@@ -215,13 +233,16 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
       project: {
         ...p,
         sections: newSections,
+        updatedAt: new Date().toISOString(),
       },
     });
   },
 
   resetProject: () => {
     if (typeof window !== 'undefined') {
-      localStorage.removeItem(STORAGE_KEY);
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch (e) {}
     }
     set({
       project: null,
@@ -230,4 +251,3 @@ export const useDocumentationStore = create<DocumentationStore>((set, get) => ({
     });
   },
 }));
-
